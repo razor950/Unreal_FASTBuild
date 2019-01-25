@@ -18,22 +18,22 @@ namespace UnrealBuildTool
 		/*---- Configurable User settings ----*/
 
 		// Used to specify a non-standard location for the FBuild.exe, for example if you have not added it to your PATH environment variable.
-		public static string FBuildExePathOverride = Path.Combine(UnrealBuildTool.EngineDirectory.FullName, "Extras\\FASTBuild\\FBuild.exe");
+		public static string FBuildExePathOverride = Path.Combine(UnrealBuildTool.EngineDirectory.FullName, "Extras", "FASTBuild");
 
         // Path to touch command to keep dependency list file's modified date in sync with compile output
-		public static string TouchExePath = Path.Combine(UnrealBuildTool.EngineDirectory.FullName, "Extras\\FASTBuild\\gnuwin\\bin\\touch.exe");
+		public static string TouchExePath = Path.Combine(UnrealBuildTool.EngineDirectory.FullName, "Extras", "FASTBuild", "gnuwin", "bin", "touch.exe");
 
 		// Controls network build distribution
 		private const bool bEnableDistribution = true;
 
 		// Controls whether to use caching at all. CachePath and CacheMode are only relevant if this is enabled.
-		private bool bEnableCaching = true;
+		private bool bEnableCaching = false;
 
         // Controls whether enable verbose output from FastBuild
 		private bool bVerboseMode = false;
 
 		// Controls whether enable detailed logging for distributed compilation
-		private bool bDistVerboseMode = true;
+		private bool bDistVerboseMode = false;
 
 		// Controls whether enable fastcancel mode
 		private bool bFastCancel = false;
@@ -84,16 +84,31 @@ namespace UnrealBuildTool
 
 		public static bool IsAvailable()
 		{
-			if (FBuildExePathOverride != "")
-			{
-				return File.Exists(FBuildExePathOverride);
-			}
-
 			// Get the name of the FASTBuild executable.
 			string fbuild = "fbuild";
 			if (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win64)
 			{
 				fbuild = "fbuild.exe";
+			}
+
+			// Don't use fast build when brokerage path is not set.
+			string FBuildBrokerage = Environment.GetEnvironmentVariable("FASTBUILD_BROKERAGE_PATH");
+			if (string.IsNullOrEmpty(FBuildBrokerage))
+				return false;
+
+			// If the override is set and we can find the directory use the correct build executable as defined above
+			if (FBuildExePathOverride != "")
+			{
+				if (Directory.Exists(FBuildExePathOverride))
+				{
+					FBuildExePathOverride = Path.Combine(FBuildExePathOverride, fbuild);
+					if (File.Exists(FBuildExePathOverride))
+					{
+						Console.WriteLine($"Using integrated FBuild at {FBuildExePathOverride}");
+						return true;
+					}
+				}
+				return false;
 			}
 
 			// Search the path for it
@@ -553,8 +568,7 @@ namespace UnrealBuildTool
 				// it probably means we are building for another platform.
 				if (BuildType == FBBuildType.Windows)
 				{
-					WindowsCompiler windowsCompiler = WindowsCompiler.VisualStudio2019;
-					VCEnv = VCEnvironment.Create(windowsCompiler, UnrealTargetPlatform.Win64, WindowsArchitecture.x64, null, null);
+					VCEnv = VCEnvironment.Create(WindowsPlatform.GetDefaultCompiler(null), UnrealTargetPlatform.Win64, WindowsArchitecture.x64, null, null);
 				}
 				else if (BuildType == FBBuildType.XBOne)
 				{
@@ -640,6 +654,7 @@ namespace UnrealBuildTool
 					const string UseLightCacheString = bEnableFBuildMod ? "true" : "false";
 					AddText(string.Format("\t.UseLightCache_Experimental = {0}\n", UseLightCacheString));
 				}
+				AddText("\t.WriteInclude = true\n");
 				AddText("}\n\n");
 
 				DirectoryReference VCToolPath64 = VCEnv.CompilerPath.Directory;
@@ -652,6 +667,7 @@ namespace UnrealBuildTool
 					const string UseLightCacheString = bEnableFBuildMod ? "true" : "false";
 					AddText(string.Format("\t.UseLightCache_Experimental = {0}\n", UseLightCacheString));
 				}
+				AddText("\t.WriteInclude = true\n");
 
 				AddText("\t.ExtraFiles =\n\t{\n");
 				AddText("\t\t'$Root$/c1.dll'\n");
@@ -1369,7 +1385,7 @@ namespace UnrealBuildTool
 			//Interesting flags for FASTBuild: -nostoponerror, -verbose, -monitor (if FASTBuild Monitor Visual Studio Extension is installed!)
 			// Yassine: The -clean is to bypass the FastBuild internal dependencies checks (cached in the fdb) as it could create some conflicts with UBT.
 			//			Basically we want FB to stupidly compile what UBT tells it to.
-			string FBCommandLine = string.Format("-monitor -summary {0} {1} {2} {3} -ide -clean {4} -config \"{5}\"", distArgument, cacheArgument, verboseArgument, distVerboseArgument, fastCancelArgument, BffFilePath);
+			string FBCommandLine = string.Format("-monitor {0} {1} {2} {3} -ide -clean {4} -config \"{5}\"", distArgument, cacheArgument, verboseArgument, distVerboseArgument, fastCancelArgument, BffFilePath);
 
 			ProcessStartInfo FBStartInfo = new ProcessStartInfo(string.IsNullOrEmpty(FBuildExePathOverride) ? "fbuild" : FBuildExePathOverride, FBCommandLine);
 
