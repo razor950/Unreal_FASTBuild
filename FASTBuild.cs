@@ -151,8 +151,8 @@ namespace UnrealBuildTool
 					BuildType = FBBuildType.XBOne;
 					return;
 				}
-				else if (action.CommandPath.FullName.Contains("Microsoft")) //Not a great test.
-				{
+				else if (action.CommandPath.FullName.Contains("Microsoft") || action.CommandArguments.Contains("Microsoft")) //Not a great test.
+				{					
 					BuildType = FBBuildType.Windows;
 					return;
 				}
@@ -1028,8 +1028,18 @@ namespace UnrealBuildTool
 		private bool AddLinkAction(List<Action> Actions, int ActionIndex, List<int> DependencyIndices)
 		{
 			Action Action = Actions[ActionIndex];
+			string CommandArguments = Action.CommandArguments;
+
+			if (Action.CommandPath.FullName.Contains("link-filter.exe"))
+			{
+    			string[] ResponseFileOptions = { "@" };
+				var ParsedResponseFileOptions = ParseCommandLineOptions(CommandArguments, ResponseFileOptions);
+				string ResponseFile = GetOptionValue(ParsedResponseFileOptions, "@", Action);
+				CommandArguments = "@\"" + ResponseFile + "\"";
+			}
+
 			string[] SpecialLinkerOptions = { "/OUT:", "@", "-o" };
-			var ParsedLinkerOptions = ParseCommandLineOptions(Action.CommandArguments, SpecialLinkerOptions, SaveResponseFile: true, SkipInputFile: Action.CommandPath.FullName.Contains("orbis-clang"));
+			var ParsedLinkerOptions = ParseCommandLineOptions(CommandArguments, SpecialLinkerOptions, SaveResponseFile: true, SkipInputFile: Action.CommandPath.FullName.Contains("orbis-clang"));
 
 			string OutputFile;
 
@@ -1085,12 +1095,12 @@ namespace UnrealBuildTool
 				AddText(string.Format("\t.PreBuildDependencies = {{ 'Action_{0}' }} \n", ActionIndex - 1));
 				AddText(string.Format("}}\n\n"));
 			}
-			else if (Action.CommandPath.FullName.Contains("lib.exe") || Action.CommandPath.FullName.Contains("orbis-snarl"))
+			else if (Action.CommandPath.FullName.Contains("link-filter.exe") || Action.CommandPath.FullName.Contains("lib.exe") || Action.CommandPath.FullName.Contains("orbis-snarl"))
 			{
 				++NumLibraryAction;
 
 				bool bUseExec = true;
-                if (bUseExec)
+				if (bUseExec)
 				{
 					AddText(string.Format("Exec('Action_{0}')\n{{\n", ActionIndex));
 					AddText(string.Format("\t.ExecExecutable = '{0}'\n", Action.CommandPath));
