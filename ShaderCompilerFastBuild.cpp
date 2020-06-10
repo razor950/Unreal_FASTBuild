@@ -1,40 +1,37 @@
-// Copyright 1998-2017 Epic Games, Inc. All Rights Reserved.
-
 #include "ShaderCompiler.h"
-#include "GenericPlatform/GenericPlatformFile.h"
 #include "HAL/PlatformFilemanager.h"
+#include "GenericPlatform/GenericPlatformFile.h"
 #include "HAL/FileManager.h"
 #include "Misc/ScopeLock.h"
 #include "Internationalization/Regex.h"
 
-#if PLATFORM_WINDOWS
+#if PLATFORM_WINDOWS // FASTBuild shader compilation is only supported on Windows.
 
 // --------------------------------------------------------------------------
 //                          Legacy XGE Xml interface                         
 // --------------------------------------------------------------------------
 
-namespace XGEShaderCompilerVariables
-{
-	extern int32 Enabled;
-	extern int32 Mode;
-	extern int32 BatchSize;
-	extern int32 BatchGroupSize;
-	extern float JobTimeout;
-}
-
 extern FArchive* CreateFileHelper(const FString& Filename);
 extern void DeleteFileHelper(const FString& Filename);
 extern void MoveFileHelper(const FString& To, const FString& From);
-
-extern FString XGE_ScriptFileName;
-extern FString XGE_ConsolePath;
 
 // --------------------------------------------------------------------------
 //                          FastBuild interface                              
 // --------------------------------------------------------------------------
 namespace FASTBuildConsoleVariables
 {
-	int32 Enabled = 0;
+	/** The total number of batches to fill with shaders before creating another group of batches. */
+	int32 BatchGroupSize = 128;
+	FAutoConsoleVariableRef CVarFASTBuildShaderCompileBatchGroupSize(
+		TEXT("r.FASTBuildShaderCompile.BatchGroupSize"),
+		BatchGroupSize,
+		TEXT("Specifies the number of batches to fill with shaders.\n")
+		TEXT("Shaders are spread across this number of batches until all the batches are full.\n")
+		TEXT("This allows the FASTBuild compile to go wider when compiling a small number of shaders.\n")
+		TEXT("Default = 128\n"),
+		ECVF_Default);
+
+	int32 Enabled = 1;
 	FAutoConsoleVariableRef CVarFASTBuildShaderCompile(
 		TEXT("r.FASTBuildShaderCompile"),
 		Enabled,
@@ -42,9 +39,34 @@ namespace FASTBuildConsoleVariables
 		TEXT("0: Local builds only. \n")
 		TEXT("1: Distribute builds using FASTBuild."),
 		ECVF_Default);
+
+	/** The maximum number of shaders to group into a single FASTBuild task. */
+	int32 BatchSize = 16;
+	FAutoConsoleVariableRef CVarFASTBuildShaderCompileBatchSize(
+		TEXT("r.FASTBuildShaderCompile.BatchSize"),
+		BatchSize,
+		TEXT("Specifies the number of shaders to batch together into a single FASTBuild task.\n")
+		TEXT("Default = 16\n"),
+		ECVF_Default);
+
+	/**
+	* The number of seconds to wait after a job is submitted before kicking off the XGE process.
+	* This allows time for the engine to enqueue more shaders, so we get better batching.
+	*/
+	float JobTimeout = 0.5f;
+	FAutoConsoleVariableRef CVarXGEShaderCompileJobTimeout(
+		TEXT("r.FASTBuildShaderCompile.JobTimeout"),
+		JobTimeout,
+		TEXT("The number of seconds to wait for additional shader jobs to be submitted before starting a build.\n")
+		TEXT("Default = 0.5\n"),
+		ECVF_Default);
 }
 
-static FString FASTBuild_ExecutablePath(TEXT("Binaries\\ThirdParty\\FASTBuild\\FBuild.exe"));
+static FString GetFASTBuild_ExecutablePath()
+{
+	return FPaths::ConvertRelativePathToFull(FPaths::EngineDir()) / TEXT("Extras\\FASTBuild\\FBuild.exe");
+}
+
 static const FString FASTBuild_CachePath(TEXT("..\\Saved\\FASTBuildCache"));
 static const FString FASTBuild_OrbisSDKToolchainRoot(TEXT("Engine\\Binaries\\ThirdParty\\PS4\\OrbisSDK"));
 static const FString FASTBuild_DurangoXDKToolchainRoot(TEXT("Engine\\Binaries\\ThirdParty\\XboxOne\\DurangoXDK"));
@@ -95,6 +117,7 @@ static const FString FASTBuild_DurangoXDKVersionToolchain[]
 	TEXT("xdk\\FXC\\amd64\\SC_DLL.dll")
 };
 
+static const FString FASTBuild_ScriptFileName(TEXT("fastbuildscript.bff"));
 static const FString FASTBuild_InputFileName(TEXT("Worker.in"));
 static const FString FASTBuild_OutputFileName(TEXT("Worker.out"));
 static const FString FASTBuild_SuccessFileName(TEXT("Success"));
@@ -106,18 +129,15 @@ bool FShaderCompileFASTBuildThreadRunnable::IsSupported()
 		// Check to see if the FASTBuild exe exists.
 		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 
-		FASTBuild_ExecutablePath = FPaths::EngineDir() / FASTBuild_ExecutablePath;
-		if (!PlatformFile.FileExists(*FASTBuild_ExecutablePath))
+		if (!PlatformFile.FileExists(*GetFASTBuild_ExecutablePath()))
 		{
-			UE_LOG(LogShaderCompilers, Warning, TEXT("Cannot use FASTBuild Shader Compiler as FASTBuild is not found."));
+			UE_LOG(LogShaderCompilers, Warning, TEXT("Cannot use FASTBuild Shader Compiler as FASTBuild is not found. Target Path:%s"), *GetFASTBuild_ExecutablePath());
 			FASTBuildConsoleVariables::Enabled = 0;
 		}
 
 		// Check that fast build brokerage path is set. No point to use fast build for local only.
-		TCHAR FBuildBrokerage[4096];
-		FPlatformMisc::GetEnvironmentVariable(TEXT("FASTBUILD_BROKERAGE_PATH"), FBuildBrokerage, ARRAY_COUNT(FBuildBrokerage));
-		FString FBuildBrokerageStr = FBuildBrokerage;
-		if (FBuildBrokerageStr.IsEmpty())
+		FString FBuildBrokerage = FPlatformMisc::GetEnvironmentVariable(TEXT("FASTBUILD_BROKERAGE_PATH"));
+		if (FBuildBrokerage.IsEmpty())
 		{
 			UE_LOG(LogShaderCompilers, Log, TEXT("Won't use FASTBuild Shader Compiler as FASTBUILD_BROKERAGE_PATH is not set."));
 			FASTBuildConsoleVariables::Enabled = 0;
@@ -133,8 +153,8 @@ FShaderCompileFASTBuildThreadRunnable::FShaderCompileFASTBuildThreadRunnable(cla
 	: FShaderCompileThreadRunnableBase(InManager)
 	, BuildProcessID(INDEX_NONE)
 	, ShaderBatchesInFlightCompleted(0)
-	, XGEWorkingDirectory(InManager->AbsoluteShaderBaseWorkingDirectory / TEXT("FASTBuild"))
-	, XGEDirectoryIndex(0)
+	, FASTBuildWorkingDirectory(InManager->AbsoluteShaderBaseWorkingDirectory / TEXT("FASTBuild"))
+	, FASTBuildDirectoryIndex(0)
 	, LastAddTime(0)
 	, StartTime(0)
 	, BatchIndexToCreate(0)
@@ -153,7 +173,7 @@ FShaderCompileFASTBuildThreadRunnable::~FShaderCompileFASTBuildThreadRunnable()
 	}
 
 	// Clean up any intermediate files/directories we've got left over.
-	IFileManager::Get().DeleteDirectory(*XGEWorkingDirectory, false, true);
+	IFileManager::Get().DeleteDirectory(*FASTBuildWorkingDirectory, false, true);
 
 	// Delete all the shader batch instances we have.
 	for (FShaderBatch* Batch : ShaderBatchesIncomplete)
@@ -169,6 +189,7 @@ FShaderCompileFASTBuildThreadRunnable::~FShaderCompileFASTBuildThreadRunnable()
 	ShaderBatchesInFlight.Empty();
 	ShaderBatchesFull.Empty();
 }
+
 
 void FShaderCompileFASTBuildThreadRunnable::PostCompletedJobsForBatch(FShaderBatch* Batch)
 {
@@ -250,7 +271,7 @@ static void FASTBuildCopyFileToDest(const FString &SourceDir, const FString &Des
 	PlatformFile.CopyFile(*ExtraFileDestPath, *ExtraFilePath);
 }
 
-static void FASTBuildWriteScriptFileHeader(FArchive* ScriptFile, const FString& WorkerName)
+static void WriteFASTBuildScriptFileHeader(FArchive* ScriptFile, const FString& WorkerName)
 {
 	static const TCHAR HeaderTemplate[] =
 		TEXT("Settings\r\n")
@@ -260,10 +281,10 @@ static void FASTBuildWriteScriptFileHeader(FArchive* ScriptFile, const FString& 
 		TEXT("\r\n")
 		TEXT("Compiler('ShaderCompiler')\r\n")
 		TEXT("{\r\n")
+		TEXT("\t.CompilerFamily = 'custom'\r\n")
 		TEXT("\t.Executable = '%s'\r\n")
 		TEXT("\t.ExecutableRootPath = '%s'\r\n")
 		TEXT("\t.SimpleDistributionMode = true\r\n")
-		TEXT("\t.CompilerFamily = 'custom'\r\n")
 		TEXT("\t.CustomEnvironmentVariables = \r\n")
 		TEXT("\t{\r\n")
 		TEXT("\t\t'SCE_ORBIS_SDK_DIR=%%1%s',\r\n")
@@ -283,7 +304,7 @@ static void FASTBuildWriteScriptFileHeader(FArchive* ScriptFile, const FString& 
 		FASTBuildAddToScriptFile(ScriptFile, ExtraFile);
 	}
 
-	class FDependencyEnumerator: public IPlatformFile::FDirectoryVisitor
+	class FDependencyEnumerator : public IPlatformFile::FDirectoryVisitor
 	{
 	public:
 		FDependencyEnumerator(FArchive* InScriptFile, const TCHAR* InPrefix, const TCHAR* InExtension)
@@ -341,19 +362,17 @@ static void FASTBuildWriteScriptFileHeader(FArchive* ScriptFile, const FString& 
 	};
 
 	// Get path to PS4 SDK.
-	TCHAR PS4SDKDir[4096];
-	FPlatformMisc::GetEnvironmentVariable(TEXT("SCE_ORBIS_SDK_DIR"), PS4SDKDir, ARRAY_COUNT(PS4SDKDir));
-	FString PS4SDKDirStr = PS4SDKDir;
+	FString PS4SDKDir = FPlatformMisc::GetEnvironmentVariable(TEXT("SCE_ORBIS_SDK_DIR"));
 
 	// If SDK found prepare files.
-	if (!PS4SDKDirStr.IsEmpty())
+	if (!PS4SDKDir.IsEmpty())
 	{
 		// Copy SDK files and copy them to local directory.
 		FString PS4ToolchainRoot = *(FPaths::RootDir() / FASTBuild_OrbisSDKToolchainRoot);
 
 		for (const FString& ExtraFilePartialPath : FASTBuild_OrbisSDKToolchain)
 		{
-			FASTBuildCopyFileToDest(PS4SDKDirStr, PS4ToolchainRoot, ExtraFilePartialPath);
+			FASTBuildCopyFileToDest(PS4SDKDir, PS4ToolchainRoot, ExtraFilePartialPath);
 		}
 
 		// Add all files in copied folder to ExtraFiles.
@@ -362,31 +381,29 @@ static void FASTBuildWriteScriptFileHeader(FArchive* ScriptFile, const FString& 
 	}
 
 	// Get path to XBox SDK.
-	TCHAR XboxOneDirectory[4096] ={0};
-	FPlatformMisc::GetEnvironmentVariable(TEXT("DurangoXDK"), XboxOneDirectory, ARRAY_COUNT(XboxOneDirectory));
-	FString XboxOneDirStr = XboxOneDirectory;
+	FString XboxOneDir = FPlatformMisc::GetEnvironmentVariable(TEXT("DurangoXDK"));
 
-	if (!XboxOneDirStr.IsEmpty())
+	if (!XboxOneDir.IsEmpty())
 	{
 		// Copy SDK files and copy them to local directory.
 		FString XboxToolchainRoot = *(FPaths::RootDir() / FASTBuild_DurangoXDKToolchainRoot);
 
 		for (const FString& ExtraFilePartialPath : FASTBuild_DurangoXDKToolchain)
 		{
-			FASTBuildCopyFileToDest(XboxOneDirStr, XboxToolchainRoot, ExtraFilePartialPath);
+			FASTBuildCopyFileToDest(XboxOneDir, XboxToolchainRoot, ExtraFilePartialPath);
 		}
 
 		// Find all directories with 6 digits as XDK versions.
 		TArray<FString> FolderNames;
 		FRegexPattern XDKVersionPattern(TEXT("^.*(\\d{6})$"));
 		FRegexVisitor Visitor = FRegexVisitor(FolderNames, XDKVersionPattern);
-		IFileManager::Get().IterateDirectory(*XboxOneDirStr, Visitor);
+		IFileManager::Get().IterateDirectory(*XboxOneDir, Visitor);
 		for (int i = 0; i < FolderNames.Num(); ++i)
 		{
 			const FString &XDKVersion = FPaths::GetCleanFilename(FolderNames[i]);
 			// Copy SDK bin files and copy them to local directory.
 			FString XboxToolchainVersionRoot = *(XboxToolchainRoot / *XDKVersion);
-			FString XboxOneVersionDirStr = *(XboxOneDirStr / *XDKVersion);
+			FString XboxOneVersionDirStr = *(XboxOneDir / *XDKVersion);
 
 			for (const FString& ExtraFilePartialPath : FASTBuild_DurangoXDKVersionToolchain)
 			{
@@ -402,23 +419,25 @@ static void FASTBuildWriteScriptFileHeader(FArchive* ScriptFile, const FString& 
 	// Add all files in modules directory starting with ShaderCompileWorker.
 	FDependencyEnumerator DllDeps = FDependencyEnumerator(ScriptFile, TEXT("ShaderCompileWorker-"), TEXT(".dll"));
 	IFileManager::Get().IterateDirectoryRecursively(*FPlatformProcess::GetModulesDirectory(), DllDeps);
-	FDependencyEnumerator ModulesDeps = FDependencyEnumerator(ScriptFile, TEXT("ShaderCompileWorker"), TEXT(".modules"));
-	IFileManager::Get().IterateDirectoryRecursively(*FPlatformProcess::GetModulesDirectory(), ModulesDeps);
 	// Uncomment when you need to get call stack of shader compiler on remote machine.
 // 	FDependencyEnumerator DllDepsPdb = FDependencyEnumerator(ScriptFile, TEXT("ShaderCompileWorker"), TEXT(".pdb"));
 // 	IFileManager::Get().IterateDirectoryRecursively(*FPlatformProcess::GetModulesDirectory(), DllDepsPdb);
 
+	FDependencyEnumerator ModulesDeps = FDependencyEnumerator(ScriptFile, TEXT("ShaderCompileWorker"), TEXT(".modules"));
+	IFileManager::Get().IterateDirectoryRecursively(*FPlatformProcess::GetModulesDirectory(), ModulesDeps);
+
 	// Add all shader files found in Plugins and Shader directories.
-	{
-		FDependencyEnumerator ShaderDeps = FDependencyEnumerator(ScriptFile, nullptr, TEXT(".ush"));
-		IFileManager::Get().IterateDirectoryRecursively(FPlatformProcess::ShaderDir(), ShaderDeps);
-		IFileManager::Get().IterateDirectoryRecursively(*(FPaths::EngineDir() / TEXT("Plugins")), ShaderDeps);
+	FDependencyEnumerator ShaderUshDeps = FDependencyEnumerator(ScriptFile, nullptr, TEXT(".ush"));
+	IFileManager::Get().IterateDirectoryRecursively(FPlatformProcess::ShaderDir(), ShaderUshDeps);
 
-		ShaderDeps.Extension = TEXT(".usf");
-		IFileManager::Get().IterateDirectoryRecursively(FPlatformProcess::ShaderDir(), ShaderDeps);
-		IFileManager::Get().IterateDirectoryRecursively(*(FPaths::EngineDir() / TEXT("Plugins")), ShaderDeps);
-	}
+	FDependencyEnumerator ShaderUsfDeps = FDependencyEnumerator(ScriptFile, nullptr, TEXT(".usf"));
+	IFileManager::Get().IterateDirectoryRecursively(FPlatformProcess::ShaderDir(), ShaderUsfDeps);
 
+	FDependencyEnumerator PluginShaderUshDeps = FDependencyEnumerator(ScriptFile, nullptr, TEXT(".ush"));
+	IFileManager::Get().IterateDirectoryRecursively(*FPaths::Combine(*(FPaths::EngineDir()), TEXT("Plugins")), PluginShaderUshDeps);
+
+	FDependencyEnumerator PluginShaderUsfDeps = FDependencyEnumerator(ScriptFile, nullptr, TEXT(".usf"));
+	IFileManager::Get().IterateDirectoryRecursively(*FPaths::Combine(*(FPaths::EngineDir()), TEXT("Plugins")), PluginShaderUsfDeps);
 
 	const FString ExtraFilesFooter =
 		TEXT("\t}\r\n")
@@ -427,7 +446,7 @@ static void FASTBuildWriteScriptFileHeader(FArchive* ScriptFile, const FString& 
 
 }
 
-static void FASTBuildWriteScriptFileFooter(FArchive* ScriptFile)
+static void WriteFASTBuildScriptFileFooter(FArchive* ScriptFile)
 {
 }
 
@@ -552,6 +571,7 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 				break;
 			}
 
+
 			// Reclaim jobs from the workers which did not succeed (if any).
 			for (int i = 0; i < ShaderBatchesInFlight.Num(); ++i)
 			{
@@ -578,7 +598,7 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 
 					// Reset the batch/directory indices and move the input file to the correct place.
 					FString OldInputFilename = Batch->InputFileNameAndPath;
-					Batch->SetIndices(XGEDirectoryIndex, BatchIndexToCreate++);
+					Batch->SetIndices(FASTBuildDirectoryIndex, BatchIndexToCreate++);
 					MoveFileHelper(Batch->InputFileNameAndPath, OldInputFilename);
 				}
 			}
@@ -596,7 +616,7 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 		// Since shader jobs are added to the shader compile manager asynchronously by the engine, 
 		// we want to give the engine enough time to queue up a large number of shaders.
 		// Otherwise we will only be kicking off a small number of shader jobs at once.
-		bool BuildDelayElapsed = (((FPlatformTime::Cycles() - LastAddTime) * FPlatformTime::GetSecondsPerCycle()) >= XGEShaderCompilerVariables::JobTimeout);
+		bool BuildDelayElapsed = (((FPlatformTime::Cycles() - LastAddTime) * FPlatformTime::GetSecondsPerCycle()) >= FASTBuildConsoleVariables::JobTimeout);
 		bool HasJobsToRun = (ShaderBatchesIncomplete.Num() > 0 || ShaderBatchesFull.Num() > 0);
 
 		if (BuildDelayElapsed && HasJobsToRun && ShaderBatchesInFlight.Num() == ShaderBatchesInFlightCompleted)
@@ -623,13 +643,13 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 			}
 
 			ShaderBatchesFull.Empty();
-			ShaderBatchesIncomplete.Empty(XGEShaderCompilerVariables::BatchGroupSize);
+			ShaderBatchesIncomplete.Empty(FASTBuildConsoleVariables::BatchGroupSize);
 
-			FString ScriptFilename = XGEWorkingDirectory / FString::FromInt(XGEDirectoryIndex) / XGE_ScriptFileName;
-
-			// Create the XGE script file.
+			FString ScriptFilename = FASTBuildWorkingDirectory / FString::FromInt(FASTBuildDirectoryIndex) / FASTBuild_ScriptFileName;
+			UE_LOG(LogShaderCompilers, Log, TEXT("Script Path:%s"), *ScriptFilename);
+			// Create the FASTBuild script file.
 			FArchive* ScriptFile = CreateFileHelper(ScriptFilename);
-			FASTBuildWriteScriptFileHeader(ScriptFile, Manager->ShaderCompileWorkerName);
+			WriteFASTBuildScriptFileHeader(ScriptFile, Manager->ShaderCompileWorkerName);
 
 			// Write the XML task line for each shader batch
 			for (FShaderBatch* Batch : ShaderBatchesInFlight)
@@ -679,7 +699,7 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 			ScriptFile->Serialize((void*)StringCast<ANSICHAR>(*AliasBuildTargetClose, AliasBuildTargetClose.Len()).Get(), sizeof(ANSICHAR) * AliasBuildTargetClose.Len());
 
 			// End the XML script file and close it.
-			FASTBuildWriteScriptFileFooter(ScriptFile);
+			WriteFASTBuildScriptFileFooter(ScriptFile);
 			delete ScriptFile;
 			ScriptFile = nullptr;
 
@@ -691,13 +711,13 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 
 			// Use stop on errors so we can respond to shader compile worker crashes immediately.
 			// Regular shader compilation errors are not returned as worker errors.
-			FString XGConsoleArgs = TEXT("-config \"") + ScriptFilename + TEXT("\" -dist -monitor -cache -ide");
+			FString FBConsoleArgs = TEXT("-config \"") + ScriptFilename + TEXT("\" -dist -monitor -cache -ide");
 
-			// Kick off the XGE process...
-			BuildProcessHandle = FPlatformProcess::CreateProc(*FASTBuild_ExecutablePath, *XGConsoleArgs, false, false, true, &BuildProcessID, 0, nullptr, nullptr);
+			// Kick off the FASTBuild process...
+			BuildProcessHandle = FPlatformProcess::CreateProc(*GetFASTBuild_ExecutablePath(), *FBConsoleArgs, false, false, true, &BuildProcessID, 0, nullptr, nullptr);
 			if (!BuildProcessHandle.IsValid())
 			{
-				UE_LOG(LogShaderCompilers, Fatal, TEXT("Failed to launch %s during shader compilation."), *XGE_ConsolePath);
+				UE_LOG(LogShaderCompilers, Fatal, TEXT("Failed to launch %s during shader compilation."), *GetFASTBuild_ExecutablePath());
 			}
 
 			// If the engine crashes, we don't get a chance to kill the build process.
@@ -709,7 +729,7 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 			// Reset batch counters and switch directories
 			BatchIndexToFill = 0;
 			BatchIndexToCreate = 0;
-			XGEDirectoryIndex = 1 - XGEDirectoryIndex;
+			FASTBuildDirectoryIndex = 1 - FASTBuildDirectoryIndex;
 
 			bWorkRemaining = true;
 		}
@@ -746,11 +766,11 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 				// There are no more incomplete shader batches available.
 				// Create another one...
 				ShaderBatchesIncomplete.Insert(BatchIndexToFill, new FShaderBatch(
-					XGEWorkingDirectory,
+					FASTBuildWorkingDirectory,
 					FASTBuild_InputFileName,
 					FASTBuild_SuccessFileName,
 					FASTBuild_OutputFileName,
-					XGEDirectoryIndex,
+					FASTBuildDirectoryIndex,
 					BatchIndexToCreate));
 
 				BatchIndexToCreate++;
@@ -761,7 +781,7 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 			CurrentBatch->AddJob(JobQueue[JobIndex]);
 
 			// If the batch is now full...
-			if (CurrentBatch->NumJobs() == XGEShaderCompilerVariables::BatchSize)
+			if (CurrentBatch->NumJobs() == FASTBuildConsoleVariables::BatchSize)
 			{
 				CurrentBatch->WriteTransferFile();
 
@@ -771,7 +791,7 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 			}
 
 			BatchIndexToFill++;
-			BatchIndexToFill %= XGEShaderCompilerVariables::BatchGroupSize;
+			BatchIndexToFill %= FASTBuildConsoleVariables::BatchGroupSize;
 		}
 
 		// Keep track of the last time we added jobs.
@@ -789,4 +809,4 @@ int32 FShaderCompileFASTBuildThreadRunnable::CompilingLoop()
 	return bWorkRemaining ? 1 : 0;
 }
 
-#endif // PLATFORM_WINDOWS
+#endif //PLATFORM_WINDOWS

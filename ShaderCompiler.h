@@ -1,15 +1,15 @@
 class FShaderCompileFASTBuildThreadRunnable : public FShaderCompileThreadRunnableBase
 {
 private:
-	/** The handle referring to the XGE console process, if a build is in progress. */
+	/** The handle referring to the FASTBuild console process, if a build is in progress. */
 	FProcHandle BuildProcessHandle;
 
-	/** Process ID of the XGE console, if a build is in progress. */
+	/** Process ID of the FASTBuild console, if a build is in progress. */
 	uint32 BuildProcessID;
 
 	/**
 	* A map of directory paths to shader jobs contained within that directory.
-	* One entry per XGE task.
+	* One entry per FASTBuild task.
 	*/
 	class FShaderBatch
 	{
@@ -64,9 +64,9 @@ private:
 	TArray<FShaderBatch*> ShaderBatchesFull;
 	TSparseArray<FShaderBatch*> ShaderBatchesIncomplete;
 
-	/** The full path to the two working directories for XGE shader builds. */
-	const FString XGEWorkingDirectory;
-	uint32 XGEDirectoryIndex;
+	/** The full path to the two working directories for FASTBuild shader builds. */
+	const FString FASTBuildWorkingDirectory;
+	uint32 FASTBuildDirectoryIndex;
 
 	uint64 LastAddTime;
 	uint64 StartTime;
